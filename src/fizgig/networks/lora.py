@@ -114,6 +114,10 @@ class LoRAModule(torch.nn.Module):
         self.org_module.forward = self.forward
         del self.org_module
 
+    def _down(self, lora_down, x):
+        """Apply one down projection. Subclasses (NoRA) change how its weight is used."""
+        return lora_down(x)
+
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
@@ -123,7 +127,7 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lx = self._down(self.lora_down, x)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -147,7 +151,7 @@ class LoRAModule(torch.nn.Module):
 
             return org_forwarded + lx * self.multiplier * scale
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            lxs = [self._down(lora_down, x) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -171,6 +175,66 @@ class LoRAModule(torch.nn.Module):
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
             return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+
+
+NORA_EPS = 1e-6
+
+
+def nora_normalize(weight: torch.Tensor, eps: float = NORA_EPS) -> torch.Tensor:
+    """Scale each input column of a LoRA down matrix (rank x in_features) to unit L2 norm over the rank.
+
+    Matches the NoRA author implementation (Joluck/NoRA, peft/src/peft/tuners/lora/layer.py @4669c35):
+    ``A / (A.norm(dim=0, keepdim=True) + 1e-6)``. Idempotent up to ``eps``.
+    """
+    return weight / (weight.norm(dim=0, keepdim=True) + eps)
+
+
+class NoRAModule(LoRAModule):
+    """NoRA (Normalized Low-Rank Adaptation) on a Linear layer.
+
+    ``mode="forward"`` (the method) normalizes the down matrix on every forward pass, with gradients flowing
+    through the normalization. ``mode="init"`` normalizes it once after initialization and then trains as an
+    ordinary LoRA (the author's init-only ablation). The author recommends ``alpha = rank``.
+
+    Saved checkpoints for ``mode="forward"`` should go through :func:`nora_export_state_dict`, which stores the
+    normalized down matrix so the file loads as an ordinary LoRA anywhere.
+    """
+
+    def __init__(self, lora_name, org_module: torch.nn.Module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, split_dims: Optional[List[int]] = None,
+                 mode: str = "forward"):
+        if org_module.__class__.__name__ != "Linear":
+            raise ValueError(f"{lora_name}: NoRA supports Linear layers only, got {org_module.__class__.__name__}")
+        if mode not in ("forward", "init"):
+            raise ValueError(f"{lora_name}: NoRA mode must be 'forward' or 'init', got {mode!r}")
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dropout, rank_dropout,
+                         module_dropout, split_dims)
+        self.nora_mode = mode
+        if mode == "init":
+            downs = self.lora_down if split_dims is not None else [self.lora_down]
+            with torch.no_grad():
+                for down in downs:
+                    down.weight.copy_(nora_normalize(down.weight))
+
+    def _down(self, lora_down, x):
+        if self.nora_mode == "forward":
+            return torch.nn.functional.linear(x, nora_normalize(lora_down.weight))
+        return lora_down(x)
+
+
+def nora_export_state_dict(state_dict: Dict[str, torch.Tensor], mode: str) -> Dict[str, torch.Tensor]:
+    """Turn a NoRA network state dict into an ordinary LoRA state dict with identical outputs.
+
+    For ``mode="forward"`` every down-matrix weight (``lora_down.weight`` or ``lora_down.<i>.weight``) is replaced
+    by its normalized version, computed in float32 and cast back; for ``mode="init"`` the weights already form an
+    ordinary LoRA. Keep the raw state dict for resuming training: the export changes the scale Adam sees.
+    """
+    if mode == "init":
+        return dict(state_dict)
+    if mode != "forward":
+        raise ValueError(f"unknown NoRA mode {mode!r}")
+    down = re.compile(r"(^|\.)lora_down(\.\d+)?\.weight$")
+    return {k: nora_normalize(v.float()).to(v.dtype) if down.search(k) else v for k, v in state_dict.items()}
 
 
 class LoRAInfModule(LoRAModule):
