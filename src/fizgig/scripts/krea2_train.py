@@ -75,6 +75,8 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="LoKR only: Kronecker split factor (w1 is ~factor x factor)")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_train_epochs", type=int, default=10)
+    p.add_argument("--max_train_steps", type=int, default=0,
+                   help="Stop after exactly this many optimizer steps (0 = run all epochs); epochs are sized to fit")
     p.add_argument("--save_every_n_epochs", type=int, default=0)
     p.add_argument("--save_state", action="store_true",
                    help="Write a resumable <name>-NNNNNN-state/ dir at every checkpoint.")
@@ -259,7 +261,7 @@ def main():
         args.dit, args.dataset_config, args.output_dir, args.output_name,
         network_dim=args.network_dim, network_alpha=args.network_alpha,
         network_type=args.network_type, lokr_factor=args.lokr_factor, nora_mode=args.nora_mode, delora_lambda=args.delora_lambda, tlora_min_rank=args.tlora_min_rank,
-        learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
+        learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs, max_train_steps=args.max_train_steps,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
         save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,
         keep_last_n_states=args.keep_last_n_states,

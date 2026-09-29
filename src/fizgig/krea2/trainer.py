@@ -1815,6 +1815,7 @@ def train_krea2(
     tlora_min_rank: int = 1,        # T-LoRA only
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
+    max_train_steps: int = 0,       # >0: stop after exactly this many optimizer steps (epochs sized to fit)
     save_every_n_epochs: int = 0,
     # Resumable state dirs. Pause/Resume saves state regardless of these — they only govern the
     # automatic saves. Each dir is LoRA + optimizer moments (~474 MB at rank 32), hence keep_n.
@@ -1968,6 +1969,9 @@ def train_krea2(
         blueprint.dataset_group, training=True, num_timestep_buckets=None, shared_epoch=shared_epoch)
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
+    if max_train_steps:
+        max_train_epochs = max(1, -(-int(max_train_steps) // max(1, group.num_train_items)))
+        logger.info(f"max_train_steps {max_train_steps}: sized to {max_train_epochs} epoch(s); stops at step {max_train_steps}")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
@@ -3263,6 +3267,8 @@ def train_krea2(
                     _ft_sched_pos["pos"] = None
                 logger.info("[ft-rotation] epoch %d: training blocks %s", epoch + 1, want)
         for i, batch in enumerate(loader):
+            if max_train_steps and global_step >= max_train_steps:
+                break
             if epoch < 2:
                 _now = time.time()
                 if _now - _warmup_note_last > 30.0:
@@ -3738,6 +3744,9 @@ def train_krea2(
             progress_bar.close()
             logger.info("[pause] state saved — exiting (exit 0).")
             sys.exit(0)
+        if max_train_steps and global_step >= max_train_steps:
+            logger.info(f"reached max_train_steps {max_train_steps} at epoch {epoch + 1}")
+            break
 
     progress_bar.close()
     if loss_watch is not None:
