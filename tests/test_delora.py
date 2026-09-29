@@ -152,7 +152,7 @@ def test_base_column_norms_are_read_from_the_unquantized_checkpoint_under_lora_n
     path = tmp_path / "raw.safetensors"
     save_file({"blocks.0.attn.wq.weight": w1, "blocks.0.attn.wq.bias": torch.randn(12),
                "diffusion_model.txtfusion.projector.weight": w2}, str(path))
-    norms = trainer._base_column_norms(str(path))
+    norms = trainer._base_weight_norms(str(path), dim=0)
     assert set(norms) == {"lora_unet_blocks_0_attn_wq", "lora_unet_txtfusion_projector"}
     torch.testing.assert_close(norms["lora_unet_blocks_0_attn_wq"], w1.norm(dim=0))
     torch.testing.assert_close(norms["lora_unet_txtfusion_projector"], w2.norm(dim=0))

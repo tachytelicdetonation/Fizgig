@@ -302,6 +302,85 @@ def delora_export_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, t
     return out
 
 
+class DoRAModule(LoRAModule):
+    """DoRA (Weight-Decomposed Low-Rank Adaptation) on a Linear layer, following PEFT's DoraLinearLayer (@b8674c8).
+
+    ``out = base(x) + (m/n - 1) * (base(x) - bias) + (m/n) * scale * B(Ax)`` with a trainable magnitude ``m`` per
+    output feature (initialized to ``||W_i||``) and ``n = ||W_i + scale (BA)_i||`` treated as a constant (detached),
+    as in the paper and PEFT. ``n`` is computed without the dense weight, so the base may be fp8/INT8:
+    ``||W_i||^2 + 2 scale <W_i, (BA)_i> + scale^2 ||(BA)_i||^2``, where ``||W_i||`` is fixed (``row_norms`` from
+    unquantized weights, or the float weight) and ``<W_i, (BA)_i>`` uses one pass of ``A``'s rows through the base.
+    """
+
+    FLOAT_WEIGHTS = (torch.float32, torch.float16, torch.bfloat16)
+
+    def __init__(self, lora_name, org_module: torch.nn.Module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, split_dims: Optional[List[int]] = None,
+                 row_norms: Optional[Dict[str, torch.Tensor]] = None):
+        if org_module.__class__.__name__ != "Linear":
+            raise ValueError(f"{lora_name}: DoRA supports Linear layers only, got {org_module.__class__.__name__}")
+        if split_dims is not None:
+            raise ValueError(f"{lora_name}: DoRA does not support split_dims")
+        if row_norms is not None:
+            if lora_name not in row_norms:
+                raise ValueError(f"{lora_name}: no base-weight row norm supplied")
+            norm = row_norms[lora_name]
+        elif org_module.weight.dtype in self.FLOAT_WEIGHTS:
+            norm = org_module.weight.detach().float().norm(dim=1)
+        else:
+            raise ValueError(f"{lora_name}: base weight is {org_module.weight.dtype}; pass row_norms from unquantized weights")
+        if norm.shape != (org_module.out_features,):
+            raise ValueError(f"{lora_name}: row norm shape {tuple(norm.shape)} != ({org_module.out_features},)")
+        bias = org_module.bias
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dropout, rank_dropout,
+                         module_dropout, None)
+        self.register_buffer("dora_w_row_sq", norm.detach().float().pow(2))
+        self.dora_magnitude = torch.nn.Parameter(norm.detach().clone().float())
+        self._base_bias = [bias]  # a plain list: the base layer owns this tensor
+
+    def _without_bias(self, out):
+        bias = self._base_bias[0]
+        return out - bias.to(out.dtype) if bias is not None else out
+
+    def weight_norm(self) -> torch.Tensor:
+        """``||W_i + scale (BA)_i||`` per output feature, without gradients."""
+        with torch.no_grad():
+            down, up = self.lora_down.weight, self.lora_up.weight
+            wa = self._without_bias(self.org_forward(down)).float()        # (rank, out) = A W^T
+            a, b = down.float(), up.float()
+            cross = (b * wa.T).sum(dim=1)
+            ba_sq = ((b @ (a @ a.T)) * b).sum(dim=1)
+            sq = self.dora_w_row_sq + 2 * self.scale * cross + self.scale ** 2 * ba_sq
+            return sq.clamp_min(0).sqrt()
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+        if self.module_dropout is not None and self.training and torch.rand(1) < self.module_dropout:
+            return org_forwarded
+        ratio = (self.dora_magnitude / self.weight_norm()).to(org_forwarded.dtype)
+        lora = torch.nn.functional.linear(torch.nn.functional.linear(x, self.lora_down.weight), self.lora_up.weight)
+        dora = (ratio - 1) * self._without_bias(org_forwarded) + ratio * lora * self.scale
+        return org_forwarded + dora * self.multiplier
+
+
+def dora_export_state_dict(state_dict: Dict[str, torch.Tensor], weight_norms: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Turn a DoRA network state dict into a ComfyUI DoRA LoRA (lora_down/lora_up/alpha/dora_scale).
+
+    ComfyUI's output-axis weight_decompose divides by the norm of the *original* weight ``||W_i||``, whereas DoRA
+    divides by ``||W_i + scale (BA)_i||``; storing ``dora_scale = m ||W_i|| / ||W_i + scale (BA)_i||`` makes ComfyUI
+    reproduce the module exactly on the base it was trained on (and closely on a fine-tune of it).
+    ``weight_norms`` maps each module prefix (``"<lora_name>."``, or ``""`` for a lone module's state dict) to
+    :meth:`DoRAModule.weight_norm`, which needs the base layer and so cannot come from the state dict alone.
+    """
+    prefixes = {k[: -len("dora_magnitude")] for k in state_dict if k.endswith("dora_magnitude")}
+    out = {k: v for k, v in state_dict.items() if not k.endswith(("dora_magnitude", "dora_w_row_sq"))}
+    for p in prefixes:
+        m = state_dict[p + "dora_magnitude"].float()
+        w = state_dict[p + "dora_w_row_sq"].float().sqrt()
+        out[p + "dora_scale"] = (m * w / weight_norms[p].float()).unsqueeze(1).to(state_dict[p + "dora_magnitude"].dtype)
+    return out
+
+
 class LoRAInfModule(LoRAModule):
     def __init__(
         self,
