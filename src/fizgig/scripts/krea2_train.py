@@ -58,10 +58,13 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_name", required=True)
     p.add_argument("--network_dim", type=int, default=32)
     p.add_argument("--network_alpha", type=float, default=32)
-    p.add_argument("--network_type", default="lora", choices=["lora", "lokr", "nora"],
+    p.add_argument("--network_type", default="lora", choices=["lora", "lokr", "nora", "delora"],
                    help="Trainable parametrization: standard LoRA, LoKR (Kronecker, "
                         "full-matrix w2 — dim/alpha unused, --lokr_factor is the dial), or NoRA "
-                        "(LoRA with a column-normalized down matrix; use alpha = rank)")
+                        "(LoRA with a column-normalized down matrix; use alpha = rank), or DeLoRA "
+                        "(norm-bounded LoRA with a trainable lambda; alpha unused)")
+    p.add_argument("--delora_lambda", type=float, default=15.0,
+                   help="DeLoRA only: initial per-module lambda (the norm bound; trainable)")
     p.add_argument("--nora_mode", default="forward", choices=["forward", "init"],
                    help="NoRA only: normalize on every forward pass (the method) or once at init (ablation)")
     p.add_argument("--lokr_factor", type=int, default=8,
@@ -251,7 +254,7 @@ def main():
     train_krea2(
         args.dit, args.dataset_config, args.output_dir, args.output_name,
         network_dim=args.network_dim, network_alpha=args.network_alpha,
-        network_type=args.network_type, lokr_factor=args.lokr_factor, nora_mode=args.nora_mode,
+        network_type=args.network_type, lokr_factor=args.lokr_factor, nora_mode=args.nora_mode, delora_lambda=args.delora_lambda,
         learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
         save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,

@@ -135,6 +135,7 @@ def load_dit_for_training(
     network_type: str = "lora",     # "lora" | "lokr" | "nora" — the trainable parametrization
     lokr_factor: int = 8,
     nora_mode: str = "forward",     # NoRA only: "forward" (normalize every pass) | "init" (once)
+    delora_lambda: float = 15.0,    # DeLoRA only: initial per-module lambda (trainable)
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
     quant_int8: str = "",          # "" | "bf16" | "int8" — W8A8 base, grad_mode of the same name
@@ -228,6 +229,13 @@ def load_dit_for_training(
         logger.info(f"network: NoRA (normalized LoRA, mode {nora_mode}), rank {network_dim}, alpha {network_alpha}")
         network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
                                  module_class=NoRAModule, module_kwargs={"mode": nora_mode})
+    elif network_type == "delora":
+        from fizgig.networks.lora import DeLoRAModule
+        logger.info(f"network: DeLoRA, rank {network_dim}, lambda {delora_lambda} (alpha unused); "
+                    f"base column norms from {os.path.basename(raw_path)}")
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
+                                 module_class=DeLoRAModule,
+                                 module_kwargs={"delora_lambda": float(delora_lambda), "w_norms": _base_column_norms(raw_path)})
     else:
         network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit)
     network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
@@ -1149,8 +1157,8 @@ def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=
     naming so resume's load_state_dict and the preview reload path work unchanged; our own
     loader ingests both via ensure_kohya_lora_state_dict."""
     is_lokr = getattr(network, "_network_type", "lora") == "lokr"
-    if getattr(network, "_network_type", "lora") == "nora":
-        _save_nora(network, path, network_dim, network_alpha, dtype, extra_metadata, raw)
+    if getattr(network, "_network_type", "lora") in ("nora", "delora"):
+        _save_exportable(network, path, network_dim, network_alpha, dtype, extra_metadata, raw)
         return
     if is_lokr:
         metadata = {
@@ -1188,25 +1196,42 @@ def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=
     network.save_weights(path, dtype, metadata)
 
 
-def _save_nora(network, path, network_dim, network_alpha, dtype, extra_metadata, raw):
-    """Save a NoRA network. Checkpoints hold the normalized down matrices (an ordinary LoRA with identical
-    outputs, loadable anywhere); the resume state (raw=True) keeps the raw ones the optimizer is walking."""
-    from fizgig.networks.lora import _precalculate_safetensors_hashes, nora_export_state_dict
+def _base_column_norms(raw_path: str) -> dict:
+    """Column norms ||W[:, j]|| of every 2-D weight in the unquantized RAW checkpoint, keyed by lora name
+    (``blocks.0.attn.wq.weight`` -> ``lora_unet_blocks_0_attn_wq``). DeLoRA needs them from bf16 weights,
+    not from the fp8/INT8 copies the training DiT holds."""
+    from safetensors import safe_open
+    norms = {}
+    with safe_open(raw_path, "pt") as f:
+        for key in f.keys():
+            if not key.endswith(".weight") or len(f.get_slice(key).get_shape()) != 2:
+                continue
+            stem = key[: -len(".weight")]
+            stem = stem[len("diffusion_model."):] if stem.startswith("diffusion_model.") else stem
+            norms["lora_unet_" + stem.replace(".", "_")] = f.get_tensor(key).float().norm(dim=0)
+    return norms
+
+
+def _save_exportable(network, path, network_dim, network_alpha, dtype, extra_metadata, raw):
+    """Save a NoRA or DeLoRA network. Checkpoints hold an ordinary LoRA with identical outputs (loadable
+    anywhere); the resume state (raw=True) keeps the method's own parameters the optimizer is walking."""
+    from fizgig.networks.lora import _precalculate_safetensors_hashes, delora_export_state_dict, nora_export_state_dict
     from safetensors.torch import save_file
-    mode = getattr(network, "_nora_mode", "forward")
+    kind = getattr(network, "_network_type")
     sd = {k: v.detach().clone().to("cpu") for k, v in network.state_dict().items()}
-    if not raw:
-        sd = nora_export_state_dict(sd, mode)
+    metadata = {"ss_network_module": f"fizgig.krea2 ({kind}, all-Linear)", "ss_adapter": kind,
+                "ss_network_dim": str(network_dim), "ss_architecture": ARCHITECTURE_KREA2}
+    if kind == "nora":
+        metadata["ss_nora_mode"] = getattr(network, "_nora_mode", "forward")
+        metadata["ss_network_alpha"] = str(network_alpha)
+        if not raw:
+            sd = nora_export_state_dict(sd, metadata["ss_nora_mode"])
+    elif not raw:
+        sd = delora_export_state_dict(sd)
+        metadata["ss_network_alpha"] = str(network_dim)
+    metadata["ss_adapter_weights"] = "raw (resume state)" if raw else "exported: ordinary LoRA, identical outputs"
     if dtype is not None:
         sd = {k: v.to(dtype) for k, v in sd.items()}
-    metadata = {
-        "ss_network_module": "fizgig.krea2 (nora, all-Linear)",
-        "ss_network_dim": str(network_dim),
-        "ss_network_alpha": str(network_alpha),
-        "ss_architecture": ARCHITECTURE_KREA2,
-        "ss_nora_mode": mode,
-        "ss_nora_weights": "raw (resume state)" if raw else "exported: normalized lora_down, load as an ordinary LoRA",
-    }
     if extra_metadata:
         metadata.update(extra_metadata)
     model_hash, legacy_hash = _precalculate_safetensors_hashes(sd, metadata)
@@ -1757,6 +1782,7 @@ def train_krea2(
     network_type: str = "lora",     # "lora" | "lokr" (Kronecker, full-matrix w2) | "nora" (normalized LoRA)
     lokr_factor: int = 8,           # LoKR only: w1 is ~factor x factor; dim/alpha unused
     nora_mode: str = "forward",     # NoRA only: "forward" | "init"
+    delora_lambda: float = 15.0,    # DeLoRA only: initial per-module lambda
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
@@ -1962,7 +1988,7 @@ def train_krea2(
     # Fine-tune trains the BASE weights — the LoRA/LoKR network is built but inert, so a LoKR
     # request would only burn VRAM on parameters that are never trained or saved. Coerce with a
     # loud log (the GUI also hides the Network Type control under fine-tune).
-    if ft_rotation and network_type in ("lokr", "nora"):
+    if ft_rotation and network_type in ("lokr", "nora", "delora"):
         logger.warning("[ft-rotation] --network_type lokr is ignored under base-model "
                        "fine-tuning (the adapter is inert) — proceeding as standard.")
         network_type = "lora"
@@ -2285,7 +2311,7 @@ def train_krea2(
 
     dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
-        network_type=network_type, lokr_factor=lokr_factor, nora_mode=nora_mode,
+        network_type=network_type, lokr_factor=lokr_factor, nora_mode=nora_mode, delora_lambda=delora_lambda,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,

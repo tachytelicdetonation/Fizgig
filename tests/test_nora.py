@@ -112,10 +112,12 @@ def test_network_has_the_same_trainable_parameters_as_lora():
     def count(module_class, kwargs):
         unet = Tiny()
         net = create_network(None, "lora_unet", 1.0, 4, 4.0, None, [], unet, module_class=module_class, module_kwargs=kwargs)
+        net.apply_to(None, unet, apply_text_encoder=False, apply_unet=True)
         return sum(p.numel() for p in net.parameters() if p.requires_grad), len(net.unet_loras)
 
-    assert count(NoRAModule, {"mode": "forward"}) == count(LoRAModule, {})
-    assert count(NoRAModule, {"mode": "forward"})[1] == 3
+    lora_params, lora_modules = count(LoRAModule, {})
+    assert lora_params == 3 * (16 * 4 + 4 * 16) and lora_modules == 3
+    assert count(NoRAModule, {"mode": "forward"}) == (lora_params, lora_modules)
 
 
 def test_trainer_checkpoints_are_exports_and_resume_state_is_raw(tmp_path):
@@ -148,7 +150,7 @@ def test_trainer_checkpoints_are_exports_and_resume_state_is_raw(tmp_path):
     trainer._save_lora(net, str(state), 4, 4.0, torch.float32, raw=True)
 
     with safe_open(str(ckpt), "pt") as f:
-        assert f.metadata()["ss_nora_weights"].startswith("exported")
+        assert f.metadata()["ss_adapter_weights"].startswith("exported")
     raw = load_file(str(state))
     for k, v in net.state_dict().items():
         torch.testing.assert_close(raw[k], v)

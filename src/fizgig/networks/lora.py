@@ -237,6 +237,71 @@ def nora_export_state_dict(state_dict: Dict[str, torch.Tensor], mode: str) -> Di
     return {k: nora_normalize(v.float()).to(v.dtype) if down.search(k) else v for k, v in state_dict.items()}
 
 
+class DeLoRAModule(LoRAModule):
+    """DeLoRA (Decoupled Low-rank Adaptation) on a Linear layer, following PEFT's DeloraLinear (@b8674c8).
+
+    ``delta W = B diag(lambda / r / (||A_i|| ||B^i||)) A``, with input column ``j`` scaled by the frozen norm of
+    the base weight's column ``||W[:, j]||``; ``lambda`` is trainable, one per module. ``A`` starts Kaiming-uniform
+    and ``B`` at zero, so training starts at the base model. ``alpha`` is not used.
+
+    ``w_norms`` maps lora names to those column norms. Pass it when the base weights are quantized: the fallback
+    computes the norm from ``org_module.weight`` and only accepts float32/float16/bfloat16 weights.
+    """
+
+    FLOAT_WEIGHTS = (torch.float32, torch.float16, torch.bfloat16)
+
+    def __init__(self, lora_name, org_module: torch.nn.Module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, split_dims: Optional[List[int]] = None,
+                 delora_lambda: float = 15.0, w_norms: Optional[Dict[str, torch.Tensor]] = None):
+        if org_module.__class__.__name__ != "Linear":
+            raise ValueError(f"{lora_name}: DeLoRA supports Linear layers only, got {org_module.__class__.__name__}")
+        if split_dims is not None:
+            raise ValueError(f"{lora_name}: DeLoRA does not support split_dims")
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dropout, rank_dropout,
+                         module_dropout, None)
+        self.delora_lambda = torch.nn.Parameter(torch.tensor([float(delora_lambda)]))
+        if w_norms is not None:
+            if lora_name not in w_norms:
+                raise ValueError(f"{lora_name}: no base-weight column norm supplied")
+            norm = w_norms[lora_name]
+        elif org_module.weight.dtype in self.FLOAT_WEIGHTS:
+            norm = org_module.weight.detach().float().norm(dim=0)
+        else:
+            raise ValueError(f"{lora_name}: base weight is {org_module.weight.dtype}; pass w_norms from unquantized weights")
+        if norm.shape != (org_module.in_features,):
+            raise ValueError(f"{lora_name}: column norm shape {tuple(norm.shape)} != ({org_module.in_features},)")
+        self.register_buffer("delora_w_norm", norm.detach().clone().float())
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+        if self.module_dropout is not None and self.training and torch.rand(1) < self.module_dropout:
+            return org_forwarded
+        down, up = self.lora_down.weight, self.lora_up.weight
+        h = torch.nn.functional.linear(x * self.delora_w_norm.to(x.dtype), down)
+        an = torch.clamp(down.norm(dim=1), min=1e-4)
+        bn = torch.clamp(up.norm(dim=0), min=1e-4)
+        h = h * ((self.delora_lambda / self.lora_dim) / (an * bn)).to(h.dtype)
+        return org_forwarded + torch.nn.functional.linear(h, up) * self.multiplier
+
+
+def delora_export_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Turn a DeLoRA network state dict into an ordinary LoRA state dict (alpha = rank) with identical outputs:
+    the column norms go into ``lora_down`` and the per-rank scaling into ``lora_up``."""
+    prefixes = {k[: -len("delora_lambda")] for k in state_dict if k.endswith("delora_lambda")}
+    handled = {p + s for p in prefixes for s in ("lora_down.weight", "lora_up.weight", "delora_lambda", "delora_w_norm", "alpha")}
+    out = {k: v for k, v in state_dict.items() if k not in handled}
+    for p in prefixes:
+        down, up = state_dict[p + "lora_down.weight"], state_dict[p + "lora_up.weight"]
+        a, b = down.float(), up.float()
+        lam, w_norm = state_dict[p + "delora_lambda"].float(), state_dict[p + "delora_w_norm"].float()
+        rank = a.shape[0]
+        scaling = (lam / rank) / (torch.clamp(a.norm(dim=1), min=1e-4) * torch.clamp(b.norm(dim=0), min=1e-4))
+        out[p + "lora_down.weight"] = (a * w_norm.unsqueeze(0)).to(down.dtype)
+        out[p + "lora_up.weight"] = (b * scaling.unsqueeze(0)).to(up.dtype)
+        out[p + "alpha"] = torch.tensor(float(rank))
+    return out
+
+
 class LoRAInfModule(LoRAModule):
     def __init__(
         self,
