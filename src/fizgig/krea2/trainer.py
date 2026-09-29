@@ -136,6 +136,7 @@ def load_dit_for_training(
     lokr_factor: int = 8,
     nora_mode: str = "forward",     # NoRA only: "forward" (normalize every pass) | "init" (once)
     delora_lambda: float = 15.0,    # DeLoRA only: initial per-module lambda (trainable)
+    tlora_min_rank: int = 1,        # T-LoRA only: rank kept at the noisiest timestep
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
     quant_int8: str = "",          # "" | "bf16" | "int8" — W8A8 base, grad_mode of the same name
@@ -229,6 +230,13 @@ def load_dit_for_training(
         logger.info(f"network: NoRA (normalized LoRA, mode {nora_mode}), rank {network_dim}, alpha {network_alpha}")
         network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
                                  module_class=NoRAModule, module_kwargs={"mode": nora_mode})
+    elif network_type == "tlora":
+        from fizgig.networks.lora import TimestepHolder, TLoRAModule
+        holder = TimestepHolder()
+        logger.info(f"network: T-LoRA (standard), rank {network_dim}, min rank {tlora_min_rank}, alpha {network_alpha}")
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
+                                 module_class=TLoRAModule, module_kwargs={"min_rank": int(tlora_min_rank), "timestep": holder})
+        network._tlora_hook = holder.attach(dit)
     elif network_type == "dora":
         from fizgig.networks.lora import DoRAModule
         logger.info(f"network: DoRA, rank {network_dim}, alpha {network_alpha}; base row norms from {os.path.basename(raw_path)}")
@@ -249,6 +257,7 @@ def load_dit_for_training(
     network._network_type = network_type
     network._lokr_factor = int(lokr_factor)
     network._nora_mode = nora_mode
+    network._tlora_min_rank = int(tlora_min_rank)
     # Dotted module paths, for the LyCORIS-standard final save (diffusion_model.<path>.lokr_*).
     # Built from the DiT itself with the same flattening create_modules used, so the reverse
     # mapping is exact even where module names contain underscores.
@@ -1162,7 +1171,7 @@ def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=
     naming so resume's load_state_dict and the preview reload path work unchanged; our own
     loader ingests both via ensure_kohya_lora_state_dict."""
     is_lokr = getattr(network, "_network_type", "lora") == "lokr"
-    if getattr(network, "_network_type", "lora") in ("nora", "delora", "dora"):
+    if getattr(network, "_network_type", "lora") in ("nora", "delora", "dora", "tlora"):
         _save_exportable(network, path, network_dim, network_alpha, dtype, extra_metadata, raw)
         return
     if is_lokr:
@@ -1232,6 +1241,10 @@ def _save_exportable(network, path, network_dim, network_alpha, dtype, extra_met
         metadata["ss_network_alpha"] = str(network_alpha)
         if not raw:
             sd = nora_export_state_dict(sd, metadata["ss_nora_mode"])
+    elif kind == "tlora":
+        metadata["ss_network_alpha"] = str(network_alpha)
+        metadata["ss_tlora_min_rank"] = str(getattr(network, "_tlora_min_rank", 1))
+        metadata["ss_tlora_max_timestep"] = "1000"
     elif kind == "dora":
         metadata["ss_network_alpha"] = str(network_alpha)
         if not raw:
@@ -1240,8 +1253,12 @@ def _save_exportable(network, path, network_dim, network_alpha, dtype, extra_met
     elif not raw:
         sd = delora_export_state_dict(sd)
         metadata["ss_network_alpha"] = str(network_dim)
-    metadata["ss_adapter_weights"] = ("raw (resume state)" if raw else "exported: ComfyUI DoRA (dora_scale), identical on the training base"
-                                      if kind == "dora" else "exported: ordinary LoRA, identical outputs")
+    metadata["ss_adapter_weights"] = (
+        "raw (resume state)" if raw
+        else "T-LoRA raw weights: inference must apply the timestep rank mask; as a plain LoRA it runs at full rank"
+        if kind == "tlora"
+        else "exported: ComfyUI DoRA (dora_scale), identical on the training base" if kind == "dora"
+        else "exported: ordinary LoRA, identical outputs")
     if dtype is not None:
         sd = {k: v.to(dtype) for k, v in sd.items()}
     if extra_metadata:
@@ -1795,6 +1812,7 @@ def train_krea2(
     lokr_factor: int = 8,           # LoKR only: w1 is ~factor x factor; dim/alpha unused
     nora_mode: str = "forward",     # NoRA only: "forward" | "init"
     delora_lambda: float = 15.0,    # DeLoRA only: initial per-module lambda
+    tlora_min_rank: int = 1,        # T-LoRA only
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
@@ -2000,7 +2018,7 @@ def train_krea2(
     # Fine-tune trains the BASE weights — the LoRA/LoKR network is built but inert, so a LoKR
     # request would only burn VRAM on parameters that are never trained or saved. Coerce with a
     # loud log (the GUI also hides the Network Type control under fine-tune).
-    if ft_rotation and network_type in ("lokr", "nora", "delora", "dora"):
+    if ft_rotation and network_type in ("lokr", "nora", "delora", "dora", "tlora"):
         logger.warning("[ft-rotation] --network_type lokr is ignored under base-model "
                        "fine-tuning (the adapter is inert) — proceeding as standard.")
         network_type = "lora"
@@ -2323,7 +2341,7 @@ def train_krea2(
 
     dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
-        network_type=network_type, lokr_factor=lokr_factor, nora_mode=nora_mode, delora_lambda=delora_lambda,
+        network_type=network_type, lokr_factor=lokr_factor, nora_mode=nora_mode, delora_lambda=delora_lambda, tlora_min_rank=tlora_min_rank,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,

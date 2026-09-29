@@ -381,6 +381,66 @@ def dora_export_state_dict(state_dict: Dict[str, torch.Tensor], weight_norms: Di
     return out
 
 
+TLORA_MAX_TIMESTEP = 1000
+
+
+def tlora_rank_mask(t: float, rank: int, min_rank: int, device=None, dtype=None) -> torch.Tensor:
+    """T-LoRA rank mask ``(1, rank)`` for a Krea 2 timestep ``t`` in [0, 1] (1 = pure noise).
+
+    Follows ``_compute_timestep_mask`` (ControlGenAI/T-LoRA, tlora_peft/layer.py @9c95c27) on the author's integer
+    scale ``int(t * 1000)`` of 1000: ``r_eff = int((1000 - ts) / 1000 * (rank - min_rank)) + min_rank``, clamped.
+    """
+    ts = int(float(t) * TLORA_MAX_TIMESTEP)
+    r_eff = int(((TLORA_MAX_TIMESTEP - ts) / TLORA_MAX_TIMESTEP) * (rank - min_rank)) + min_rank
+    r_eff = max(min_rank, min(rank, r_eff))
+    mask = torch.zeros((1, rank), device=device, dtype=dtype)
+    mask[:, :r_eff] = 1.0
+    return mask
+
+
+class TimestepHolder:
+    """The current diffusion timestep, shared by all T-LoRA modules of a network. Like the author's training
+    script it keeps the first timestep of the batch. :meth:`attach` installs a forward pre-hook on the DiT that
+    reads its ``t`` keyword, which both Fizgig training and sampling pass."""
+
+    def __init__(self):
+        self.t: Optional[float] = None
+
+    def set(self, t) -> None:
+        self.t = float(t.flatten()[0]) if isinstance(t, torch.Tensor) else float(t)
+
+    def attach(self, dit: torch.nn.Module):
+        def hook(_module, _args, kwargs):
+            if "t" in kwargs and kwargs["t"] is not None:
+                self.set(kwargs["t"])
+        return dit.register_forward_pre_hook(hook, with_kwargs=True)
+
+
+class TLoRAModule(LoRAModule):
+    """T-LoRA (standard, non-orthogonal) on a Linear layer: a LoRA whose rank components above
+    ``r_eff(t)`` are masked after the down projection (see :func:`tlora_rank_mask`), so noisier timesteps
+    train and use fewer components. It has no static LoRA equivalent: inference needs the same masking.
+    """
+
+    def __init__(self, lora_name, org_module: torch.nn.Module, multiplier=1.0, lora_dim=4, alpha=1,
+                 dropout=None, rank_dropout=None, module_dropout=None, split_dims: Optional[List[int]] = None,
+                 min_rank: int = 1, timestep: Optional[TimestepHolder] = None):
+        if org_module.__class__.__name__ != "Linear":
+            raise ValueError(f"{lora_name}: T-LoRA supports Linear layers only, got {org_module.__class__.__name__}")
+        if timestep is None:
+            raise ValueError(f"{lora_name}: T-LoRA needs a shared TimestepHolder")
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dropout, rank_dropout,
+                         module_dropout, split_dims)
+        self.min_rank = max(1, min(int(min_rank), lora_dim))
+        self._timestep = timestep
+
+    def _down(self, lora_down, x):
+        if self._timestep.t is None:
+            raise RuntimeError(f"{self.lora_name}: no timestep set; attach the TimestepHolder to the DiT")
+        lx = lora_down(x)
+        return lx * tlora_rank_mask(self._timestep.t, self.lora_dim, self.min_rank, lx.device, lx.dtype)
+
+
 class LoRAInfModule(LoRAModule):
     def __init__(
         self,
